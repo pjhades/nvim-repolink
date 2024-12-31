@@ -1,0 +1,11 @@
+[package]
+name = "nvim-repolink"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nvim-oxi = { version = "0.5.1", features = ["neovim-0-9", "neovim-0-10"] }
+serde = "1.0.217"
+
+[lib]
+crate-type = ["cdylib"]
