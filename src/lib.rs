@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Error};
-use git2::{BranchType, ErrorCode, Oid, Remote, Repository};
+use git2::{BranchType, ErrorCode, Remote, Repository};
 use nvim_oxi::api::opts::CreateCommandOpts;
 use nvim_oxi::api::types::{CommandArgs, CommandNArgs, CommandRange};
 use nvim_oxi::{api, print};
@@ -65,28 +65,14 @@ fn generate_repolink(args: CommandArgs) -> Result<(), Error> {
             Err(e) if e.code() == ErrorCode::NotFound => {
                 // Current branch doesn't track any remote ones. Try to search for
                 // its tip commit in all the remote references.
-                let commit = head.peel_to_commit()?;
-                match locate_commit(&repo, commit.id())? {
-                    Some(remote) => remote,
-                    None => {
-                        return Err(anyhow!("Cannot find remote matching current branch"));
-                    }
-                }
+                locate_commit(&repo)?.ok_or(anyhow!("not found"))?
             }
             Err(e) => {
                 return Err(Error::from(e));
             }
         }
     } else if repo.head_detached()? || head.is_tag() {
-        let commit = head.peel_to_commit()?;
-        match locate_commit(&repo, commit.id())? {
-            Some(remote) => remote,
-            None => {
-                return Err(anyhow!(
-                    "Cannot find remote matching current detached HEAD or tag"
-                ))
-            }
-        }
+        locate_commit(&repo)?.ok_or(anyhow!("not found"))?
     } else {
         return Err(anyhow!("HEAD is neither a branch nor a tag"));
     };
@@ -96,7 +82,11 @@ fn generate_repolink(args: CommandArgs) -> Result<(), Error> {
     Ok(())
 }
 
-fn locate_commit(repo: &Repository, hash: Oid) -> Result<Option<Remote<'_>>, Error> {
+fn locate_commit(repo: &Repository) -> Result<Option<Remote<'_>>, Error> {
+    let head = repo.head()?;
+    let hash = head.peel_to_commit()?.id();
+    let mut ret = None;
+
     for r in repo.references()? {
         if r.is_err() {
             continue;
@@ -109,15 +99,11 @@ fn locate_commit(repo: &Repository, hash: Oid) -> Result<Option<Remote<'_>>, Err
         if r.is_remote() {
             let shorthand = std::str::from_utf8(r.shorthand_bytes())?;
             let (remote, branch) = split_shorthand(shorthand);
-            if branch == "HEAD" {
-                continue;
+            if branch != "HEAD" {
+                ret = Some(repo.find_remote(remote)?);
             }
-            return repo
-                .find_remote(remote)
-                .map(Some)
-                .map_err(|e| Error::from(e));
         }
     }
 
-    Ok(None)
+    Ok(ret)
 }
