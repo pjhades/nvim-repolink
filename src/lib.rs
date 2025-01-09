@@ -26,6 +26,17 @@ fn nvim_repolink() -> Result<(), Error> {
     Ok(())
 }
 
+struct LineRange(usize, usize);
+
+impl std::fmt::Display for LineRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        match (self.0, self.1) {
+            (begin, end) if begin == end => write!(f, "#L{begin}"),
+            (begin, end) => write!(f, "#L{begin}-L{end}"),
+        }
+    }
+}
+
 enum GitObject {
     Branch(String),
     Tag(String),
@@ -75,7 +86,7 @@ fn generate_repolink(args: CommandArgs) -> Result<(), Error> {
     let range = if args.range == 0 {
         None
     } else {
-        Some((args.line1, args.line2))
+        Some(LineRange(args.line1, args.line2))
     };
 
     let url = GitUrl::parse(std::str::from_utf8(remote.url_bytes())?)?;
@@ -90,7 +101,7 @@ fn make_link(
     url: GitUrl,
     gitobj: GitObject,
     path: String,
-    range: Option<(usize, usize)>,
+    range: Option<LineRange>,
 ) -> Result<String, Error> {
     let project = project_name(&url);
     let host = url.host.ok_or(anyhow!("Unknown Git hosting site"))?;
@@ -105,10 +116,8 @@ fn make_link(
     match gitobj {
         GitObject::Branch(name) | GitObject::Tag(name) => {
             link.push_str(format!("/blob/{name}/{path}").as_str());
-            match range {
-                Some((begin, end)) if begin == end => link.push_str(format!("#L{begin}").as_str()),
-                Some((begin, end)) => link.push_str(format!("#L{begin}-L{end}").as_str()),
-                None => (),
+            if let Some(range) = range {
+                link.push_str(format!("{range}").as_str());
             }
         }
         GitObject::Commit(hash) => link.push_str(format!("/commit/{hash}").as_str()),
