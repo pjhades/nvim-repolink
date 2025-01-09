@@ -1,9 +1,37 @@
 use anyhow::{anyhow, Error};
-use git2::{BranchType, ErrorCode, Reference, Remote, Repository};
+use git2::{BranchType, ErrorCode, Reference, Repository};
 use git_url_parse::GitUrl;
 use nvim_oxi::api::opts::CreateCommandOpts;
 use nvim_oxi::api::types::{CommandArgs, CommandNArgs, CommandRange};
 use nvim_oxi::{api, print};
+
+#[derive(Debug)]
+struct Utf8Error(&'static str);
+
+impl std::fmt::Display for Utf8Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        write!(f, "invalid utf-8 in {}", self.0)
+    }
+}
+
+impl std::error::Error for Utf8Error {}
+
+struct LineRange(usize, usize);
+
+impl std::fmt::Display for LineRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        match (self.0, self.1) {
+            (begin, end) if begin == end => write!(f, "#L{begin}"),
+            (begin, end) => write!(f, "#L{begin}-L{end}"),
+        }
+    }
+}
+
+enum GitObject {
+    Branch(String),
+    Tag(String),
+    Commit(String),
+}
 
 #[nvim_oxi::plugin]
 fn nvim_repolink() -> Result<(), Error> {
@@ -26,23 +54,6 @@ fn nvim_repolink() -> Result<(), Error> {
     Ok(())
 }
 
-struct LineRange(usize, usize);
-
-impl std::fmt::Display for LineRange {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        match (self.0, self.1) {
-            (begin, end) if begin == end => write!(f, "#L{begin}"),
-            (begin, end) => write!(f, "#L{begin}-L{end}"),
-        }
-    }
-}
-
-enum GitObject {
-    Branch(String),
-    Tag(String),
-    Commit(String),
-}
-
 fn generate_repolink(args: CommandArgs) -> Result<(), Error> {
     let repo = Repository::discover(std::env::current_dir()?)?;
     let remote_name = args.args.unwrap_or("origin".to_string());
@@ -50,9 +61,10 @@ fn generate_repolink(args: CommandArgs) -> Result<(), Error> {
     let head = repo.head()?;
 
     if head.is_note() || head.is_tag() || head.is_remote() {
-        return Err(anyhow!("HEAD points directly to a note, tag or remote"));
+        return Err(anyhow!("head points directly to a note, tag or remote"));
     }
 
+    // Figure out what HEAD is: a branch, a tag, or a commit.
     let gitobj = if repo.head_detached()? {
         search_references(&repo, |r| {
             if !r.is_tag() {
@@ -70,19 +82,20 @@ fn generate_repolink(args: CommandArgs) -> Result<(), Error> {
     } else if head.is_branch() {
         get_remote_branch(&repo, &remote_name)?
     } else {
-        return Err(anyhow!("HEAD is neither a branch nor detached"));
+        None
     }
-    .ok_or(anyhow!("Cannot figure out branch, tag or commit"))?;
+    .ok_or(anyhow!("head is not a branch, a tag or a commit"))?;
 
-    let repo_path = repo.workdir().ok_or(anyhow!("Repository is bare"))?;
+    let repo_path = repo.workdir().ok_or(anyhow!("repository is bare"))?;
     let file_path = api::get_current_buf().get_name()?;
     let rel_path = file_path
         .strip_prefix(repo_path)
-        .map_err(|e| anyhow!("Failed to figure out relative path of current buffer: {e}"))?
+        .map_err(|e| anyhow!("cannot figure out relative path of current buffer: {e}"))?
         .to_path_buf()
         .into_os_string()
         .into_string()
         .unwrap_or_else(|s| s.as_os_str().to_string_lossy().to_string());
+
     let range = if args.range == 0 {
         None
     } else {
@@ -91,8 +104,7 @@ fn generate_repolink(args: CommandArgs) -> Result<(), Error> {
 
     let url = GitUrl::parse(std::str::from_utf8(remote.url_bytes())?)?;
 
-    let link = make_link(url, gitobj, rel_path, range)?;
-    print!("{link}");
+    print!("{}", make_link(url, gitobj, rel_path, range)?);
 
     Ok(())
 }
@@ -104,13 +116,13 @@ fn make_link(
     range: Option<LineRange>,
 ) -> Result<String, Error> {
     let project = project_name(&url);
-    let host = url.host.ok_or(anyhow!("Unknown Git hosting site"))?;
-    let owner = url.owner.ok_or(anyhow!("Unknown repository owner"))?;
+    let host = url.host.ok_or(anyhow!("unknown Git hosting site"))?;
+    let owner = url.owner.ok_or(anyhow!("unknown repository owner"))?;
     let mut link = String::new();
 
     match host {
         h if h == "github.com" => link.push_str(format!("https://{h}/{owner}/{project}").as_str()),
-        _ => return Err(anyhow!("Unknown git hosting site")),
+        _ => return Err(anyhow!("unknown git hosting site")),
     }
 
     match gitobj {
