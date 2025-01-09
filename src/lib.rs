@@ -195,11 +195,10 @@ fn split_shorthand(shorthand: &str) -> (&str, &str) {
 
 fn project_name(url: &GitUrl) -> String {
     let parts = url.path.as_str().split('/').collect::<Vec<&str>>();
-    parts
-        .iter()
-        .last()
-        .unwrap()
-        .strip_suffix(".git")
-        .unwrap()
-        .to_string()
+    let name = parts.iter().last().unwrap();
+    if url.git_suffix {
+        name.strip_suffix(".git").unwrap().to_string()
+    } else {
+        name.to_string()
+    }
 }
