@@ -1,20 +1,45 @@
-use anyhow::{anyhow, Error};
 use git2::{BranchType, ErrorCode, Reference, Repository};
 use git_url_parse::GitUrl;
 use nvim_oxi::api::opts::CreateCommandOpts;
 use nvim_oxi::api::types::{CommandArgs, CommandNArgs, CommandRange};
 use nvim_oxi::{api, print};
+use thiserror::Error;
 
-#[derive(Debug)]
-struct Utf8Error(&'static str);
+#[derive(Error, Debug)]
+enum PluginError {
+    #[error("Invalid current working directory: {0}")]
+    Io(#[from] std::io::Error),
 
-impl std::fmt::Display for Utf8Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        write!(f, "invalid utf-8 in {}", self.0)
-    }
+    #[error("Invalid UTF-8 in {0}")]
+    Utf8(&'static str),
+
+    #[error("Nvim API error: {0}")]
+    NvimApi(#[from] api::Error),
+
+    #[error("Cannot figure out relative path of current buffer")]
+    RelativePath(#[from] std::path::StripPrefixError),
+
+    #[error("Git error: {0}")]
+    Git(#[from] git2::Error),
+
+    #[error("Parsing Git URL: {0}")]
+    GitUrlParse(#[from] git_url_parse::GitUrlParseError),
+
+    #[error("HEAD is not a branch, a tag or a commit")]
+    InvalidHeadType,
+
+    #[error("Repository is bare")]
+    BareRepository,
+
+    #[error("Missing Git hosting site")]
+    MissingGitHostingSite,
+
+    #[error("Missing repository owner")]
+    MissingRepositoryOwner,
+
+    #[error("Unsupported Git hosting site")]
+    UnsupportedGitHostingSite,
 }
-
-impl std::error::Error for Utf8Error {}
 
 struct LineRange(usize, usize);
 
@@ -34,7 +59,7 @@ enum GitObject {
 }
 
 #[nvim_oxi::plugin]
-fn nvim_repolink() -> Result<(), Error> {
+fn nvim_repolink() -> Result<(), PluginError> {
     let opts = CreateCommandOpts::builder()
         .bang(true)
         .nargs(CommandNArgs::ZeroOrOne)
@@ -54,17 +79,15 @@ fn nvim_repolink() -> Result<(), Error> {
     Ok(())
 }
 
-fn generate_repolink(args: CommandArgs) -> Result<(), Error> {
+fn generate_repolink(args: CommandArgs) -> Result<(), PluginError> {
     let repo = Repository::discover(std::env::current_dir()?)?;
     let remote_name = args.args.unwrap_or("origin".to_string());
     let remote = repo.find_remote(&remote_name)?;
     let head = repo.head()?;
 
     if head.is_note() || head.is_tag() || head.is_remote() {
-        return Err(anyhow!("head points directly to a note, tag or remote"));
+        return Err(PluginError::InvalidHeadType);
     }
-
-    // Figure out what HEAD is: a branch, a tag, or a commit.
     let gitobj = if repo.head_detached()? {
         search_references(&repo, |r| {
             if !r.is_tag() {
@@ -84,13 +107,12 @@ fn generate_repolink(args: CommandArgs) -> Result<(), Error> {
     } else {
         None
     }
-    .ok_or(anyhow!("head is not a branch, a tag or a commit"))?;
+    .ok_or(PluginError::InvalidHeadType)?;
 
-    let repo_path = repo.workdir().ok_or(anyhow!("repository is bare"))?;
+    let repo_path = repo.workdir().ok_or(PluginError::BareRepository)?;
     let file_path = api::get_current_buf().get_name()?;
     let rel_path = file_path
-        .strip_prefix(repo_path)
-        .map_err(|e| anyhow!("cannot figure out relative path of current buffer: {e}"))?
+        .strip_prefix(repo_path)?
         .to_path_buf()
         .into_os_string()
         .into_string()
@@ -102,7 +124,9 @@ fn generate_repolink(args: CommandArgs) -> Result<(), Error> {
         Some(LineRange(args.line1, args.line2))
     };
 
-    let url = GitUrl::parse(std::str::from_utf8(remote.url_bytes())?)?;
+    let url = GitUrl::parse(
+        std::str::from_utf8(remote.url_bytes()).map_err(|_| PluginError::Utf8("remote URL"))?,
+    )?;
 
     print!("{}", make_link(url, gitobj, rel_path, range)?);
 
@@ -114,15 +138,15 @@ fn make_link(
     gitobj: GitObject,
     path: String,
     range: Option<LineRange>,
-) -> Result<String, Error> {
+) -> Result<String, PluginError> {
     let project = project_name(&url);
-    let host = url.host.ok_or(anyhow!("unknown Git hosting site"))?;
-    let owner = url.owner.ok_or(anyhow!("unknown repository owner"))?;
+    let host = url.host.ok_or(PluginError::MissingGitHostingSite)?;
+    let owner = url.owner.ok_or(PluginError::MissingRepositoryOwner)?;
     let mut link = String::new();
 
     match host {
         h if h == "github.com" => link.push_str(format!("https://{h}/{owner}/{project}").as_str()),
-        _ => return Err(anyhow!("unknown git hosting site")),
+        _ => return Err(PluginError::UnsupportedGitHostingSite),
     }
 
     match gitobj {
@@ -138,14 +162,19 @@ fn make_link(
     Ok(link)
 }
 
-fn get_remote_branch(repo: &Repository, wanted_remote: &str) -> Result<Option<GitObject>, Error> {
+fn get_remote_branch(
+    repo: &Repository,
+    wanted_remote: &str,
+) -> Result<Option<GitObject>, PluginError> {
     let head = repo.head()?;
-    let name = std::str::from_utf8(head.shorthand_bytes())?;
+    let name =
+        std::str::from_utf8(head.shorthand_bytes()).map_err(|_| PluginError::Utf8("HEAD"))?;
     let branch = repo.find_branch(name, BranchType::Local)?;
 
     match branch.upstream() {
         Ok(upstream) => {
-            let shorthand = std::str::from_utf8(upstream.name_bytes()?)?;
+            let shorthand = std::str::from_utf8(upstream.name_bytes()?)
+                .map_err(|_| PluginError::Utf8("remote branch"))?;
             let (_, branch) = split_shorthand(shorthand);
             Ok(Some(GitObject::Branch(branch.to_string())))
         }
@@ -171,7 +200,7 @@ fn get_remote_branch(repo: &Repository, wanted_remote: &str) -> Result<Option<Gi
 fn search_references(
     repo: &Repository,
     f: impl Fn(Reference<'_>) -> Option<GitObject>,
-) -> Result<Option<GitObject>, Error> {
+) -> Result<Option<GitObject>, PluginError> {
     let head = repo.head()?;
     let hash = head.peel_to_commit()?.id();
     let ret = repo.references()?.find_map(|r| {

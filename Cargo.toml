@@ -4,11 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1.0.95"
 git-url-parse = "0.4.5"
 git2 = "0.19.0"
 nvim-oxi = { version = "0.5.1", features = ["neovim-0-9", "neovim-0-10"] }
-serde = "1.0.217"
+thiserror = "2.0.10"
 
 [lib]
 crate-type = ["cdylib"]
