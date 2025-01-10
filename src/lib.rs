@@ -83,31 +83,11 @@ fn generate_repolink(args: CommandArgs) -> Result<(), PluginError> {
     let repo = Repository::discover(std::env::current_dir()?)?;
     let remote_name = args.args.unwrap_or("origin".to_string());
     let remote = repo.find_remote(&remote_name)?;
-    let head = repo.head()?;
+    let url = GitUrl::parse(
+        std::str::from_utf8(remote.url_bytes()).map_err(|_| PluginError::Utf8("remote URL"))?,
+    )?;
 
-    if head.is_note() || head.is_tag() || head.is_remote() {
-        return Err(PluginError::InvalidHeadType);
-    }
-    let gitobj = if repo.head_detached()? {
-        search_references(&repo, |r| {
-            if !r.is_tag() {
-                return None;
-            }
-            std::str::from_utf8(r.shorthand_bytes())
-                .ok()
-                .map(|s| GitObject::Tag(s.to_string()))
-        })?
-        .or_else(|| {
-            head.peel_to_commit()
-                .ok()
-                .map(|commit| GitObject::Commit(commit.id().to_string()))
-        })
-    } else if head.is_branch() {
-        get_remote_branch(&repo, &remote_name)?
-    } else {
-        None
-    }
-    .ok_or(PluginError::InvalidHeadType)?;
+    let head_obj = figure_out_git_head(&repo, &remote_name)?;
 
     let repo_path = repo.workdir().ok_or(PluginError::BareRepository)?;
     let file_path = api::get_current_buf().get_name()?;
@@ -124,18 +104,44 @@ fn generate_repolink(args: CommandArgs) -> Result<(), PluginError> {
         Some(LineRange(args.line1, args.line2))
     };
 
-    let url = GitUrl::parse(
-        std::str::from_utf8(remote.url_bytes()).map_err(|_| PluginError::Utf8("remote URL"))?,
-    )?;
-
-    print!("{}", make_link(url, gitobj, rel_path, range)?);
+    print!("{}", make_link(url, head_obj, rel_path, range)?);
 
     Ok(())
 }
 
+fn figure_out_git_head(repo: &Repository, remote_name: &str) -> Result<GitObject, PluginError> {
+    let head = repo.head()?;
+
+    if head.is_note() || head.is_tag() || head.is_remote() {
+        return Err(PluginError::InvalidHeadType);
+    }
+
+    let head_obj = if repo.head_detached()? {
+        search_references(&repo, |r| {
+            if !r.is_tag() {
+                return None;
+            }
+            std::str::from_utf8(r.shorthand_bytes())
+                .ok()
+                .map(|s| GitObject::Tag(s.to_string()))
+        })?
+        .or_else(|| {
+            head.peel_to_commit()
+                .ok()
+                .map(|commit| GitObject::Commit(commit.id().to_string()))
+        })
+    } else if head.is_branch() {
+        get_remote_branch(&repo, remote_name)?
+    } else {
+        None
+    };
+
+    head_obj.ok_or(PluginError::InvalidHeadType)
+}
+
 fn make_link(
     url: GitUrl,
-    gitobj: GitObject,
+    head_obj: GitObject,
     path: String,
     range: Option<LineRange>,
 ) -> Result<String, PluginError> {
@@ -149,7 +155,7 @@ fn make_link(
         _ => return Err(PluginError::UnsupportedGitHostingSite),
     }
 
-    match gitobj {
+    match head_obj {
         GitObject::Branch(name) | GitObject::Tag(name) => {
             link.push_str(format!("/blob/{name}/{path}").as_str());
             if let Some(range) = range {
