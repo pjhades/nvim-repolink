@@ -11,6 +11,3 @@ thiserror = "2.0.10"
 
 [lib]
 crate-type = ["cdylib"]
-
-[dev-dependencies]
-tempdir = "0.3.7"
