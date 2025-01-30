@@ -2,8 +2,41 @@ use git2::{BranchType, ErrorCode, Reference, Repository};
 use git_url_parse::GitUrl;
 use nvim_oxi::api::opts::CreateCommandOpts;
 use nvim_oxi::api::types::{CommandArgs, CommandNArgs, CommandRange};
-use nvim_oxi::{api, print};
+use nvim_oxi::conversion::{self, FromObject, ToObject};
+use nvim_oxi::serde::{Deserializer, Serializer};
+use nvim_oxi::{api, lua, print, Dictionary, Function, Object};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+#[derive(Serialize, Deserialize)]
+struct Config {}
+
+impl FromObject for Config {
+    fn from_object(obj: Object) -> Result<Self, conversion::Error> {
+        Self::deserialize(Deserializer::new(obj)).map_err(Into::into)
+    }
+}
+
+impl ToObject for Config {
+    fn to_object(self) -> Result<Object, conversion::Error> {
+        self.serialize(Serializer::new()).map_err(Into::into)
+    }
+}
+
+impl lua::Poppable for Config {
+    unsafe fn pop(lstate: *mut lua::ffi::lua_State) -> Result<Self, lua::Error> {
+        let obj = Object::pop(lstate)?;
+        Self::from_object(obj).map_err(lua::Error::pop_error_from_err::<Self, _>)
+    }
+}
+
+impl lua::Pushable for Config {
+    unsafe fn push(self, lstate: *mut lua::ffi::lua_State) -> Result<std::ffi::c_int, lua::Error> {
+        self.to_object()
+            .map_err(lua::Error::push_error_from_err::<Self, _>)?
+            .push(lstate)
+    }
+}
 
 #[derive(Error, Debug)]
 enum PluginError {
@@ -60,7 +93,7 @@ enum GitObject {
 }
 
 #[nvim_oxi::plugin]
-fn nvim_repolink() -> Result<(), PluginError> {
+fn nvim_repolink() -> Result<Dictionary, PluginError> {
     let opts = CreateCommandOpts::builder()
         .bang(true)
         .nargs(CommandNArgs::ZeroOrOne)
@@ -77,7 +110,13 @@ fn nvim_repolink() -> Result<(), PluginError> {
         &opts,
     )?;
 
-    Ok(())
+    // This will allow Lazy to call `require(...).setup({})`, so that we won't have to ask the user
+    // to manually call `require` or using `config = ...` in Lazy. Lazy dissuades the use of
+    // `config`. See https://lazy.folke.io/spec.
+    Ok(Dictionary::from_iter([(
+        "setup",
+        Object::from(Function::from_fn(|_: Config| {})),
+    )]))
 }
 
 fn generate_repolink(args: CommandArgs) -> Result<(), PluginError> {

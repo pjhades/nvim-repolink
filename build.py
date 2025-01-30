@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import os, argparse, subprocess, sys
+import os, argparse, subprocess, sys, shutil
 
 if sys.platform == 'linux':
     LIB = 'libnvim_repolink.so'
@@ -11,6 +11,12 @@ elif sys.platform == 'win32':
 elif sys.platform == 'darwin':
     LIB = 'libnvim_repolink.dylib'
     OUT = 'nvim_repolink.so'
+else:
+    print('Unsupported platform')
+    sys.exit(1)
+
+LUA = 'lua'
+OUT = os.path.join(LUA, OUT)
 
 def cmd(x):
     try:
@@ -19,21 +25,27 @@ def cmd(x):
     except Exception as e:
         print(f'{e}')
 
+def lib(args):
+    return os.path.join('target', 'debug' if args.debug_build else 'release', LIB)
+
 def build(args):
-    flags = '' if args.debug_build else ' --release'
-    src = os.path.join('target', 'debug' if args.debug_build else 'release', LIB)
-    cmd('cargo build' + flags)
+    flags = '' if args.debug_build else '--release'
+    cmd(f'cargo build {flags}')
     try:
-        os.rename(src, OUT)
+        os.mkdir(LUA)
+    except FileExistsError:
+        pass
+    try:
+        os.rename(lib(args), OUT)
     except OSError as e:
         print(f'{e}')
 
 def clean(args):
     cmd('cargo clean')
     try:
-        os.remove(OUT)
-    except FileNotFoundError as e:
-        print(f'{e}')
+        shutil.rmtree(LUA)
+    except:
+        pass
 
 def main():
     p = argparse.ArgumentParser()
@@ -42,8 +54,7 @@ def main():
     args = p.parse_args()
     actions = {'build': build, 'clean': clean}
     def usage():
-        print(f'{sys.argv[0]} {"|".join(actions.keys())}', file=sys.stderr)
-
+        print(f'{sys.argv[0]} {"|".join(actions.keys())}')
     try:
         actions[args.action](args)
     except KeyError:
