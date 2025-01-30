@@ -343,6 +343,7 @@ dependencies = [
  "git-url-parse",
  "git2",
  "nvim-oxi",
+ "serde",
  "thiserror 2.0.10",
 ]
 
