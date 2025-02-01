@@ -10,7 +10,7 @@ elif sys.platform == 'win32':
     OUT = LIB
 elif sys.platform == 'darwin':
     LIB = 'libnvim_repolink.dylib'
-    OUT = 'nvim_repolink.so'
+    OUT = 'nvim-repolink.so'
 else:
     print('Unsupported platform')
     sys.exit(1)
