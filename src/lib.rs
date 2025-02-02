@@ -8,6 +8,9 @@ use nvim_oxi::{api, lua, print, Dictionary, Function, Object};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod services;
+use services::LineRange;
+
 #[derive(Serialize, Deserialize)]
 struct Config {}
 
@@ -70,19 +73,8 @@ enum PluginError {
     #[error("Missing repository owner")]
     MissingRepositoryOwner,
 
-    #[error("Unsupported Git hosting site")]
-    UnsupportedGitHostingSite,
-}
-
-struct LineRange(usize, usize);
-
-impl std::fmt::Display for LineRange {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        match (self.0, self.1) {
-            (begin, end) if begin == end => write!(f, "#L{begin}"),
-            (begin, end) => write!(f, "#L{begin}-L{end}"),
-        }
-    }
+    #[error("Unsupported Git hosting site: {0}")]
+    UnsupportedGitHostingSite(String),
 }
 
 #[derive(Debug, PartialEq)]
@@ -190,20 +182,33 @@ fn make_link(
     let owner = url.owner.ok_or(PluginError::MissingRepositoryOwner)?;
     let mut link = String::new();
 
-    match host {
-        h if h == "github.com" => link.push_str(format!("https://{h}/{owner}/{project}").as_str()),
-        _ => return Err(PluginError::UnsupportedGitHostingSite),
+    use services::Data;
+
+    let service = services::service_for(host.as_str());
+    if service.is_none() {
+        return Err(PluginError::UnsupportedGitHostingSite(host));
     }
 
+    let mut data = Data{
+        project: project.as_str(),
+        owner: owner.as_str(),
+        path: path.as_str(),
+        service: service.unwrap(),
+        line_range: &range,
+        branch_or_tag_name: None,
+        hash: None,
+    };
+
+    link.push_str(services::project_url_from(&data).as_str());
+
     match head_obj {
-        GitObject::Branch(name) | GitObject::Tag(name) => {
-            link.push_str(format!("/blob/{name}/{path}").as_str());
-            if let Some(range) = range {
-                link.push_str(format!("{range}").as_str());
-            }
-        }
-        GitObject::Commit(hash) => link.push_str(format!("/commit/{hash}").as_str()),
+        GitObject::Branch(name) | GitObject::Tag(name) =>
+            data.branch_or_tag_name = Some(name),
+        GitObject::Commit(hash) =>
+            data.hash = Some(hash),
     }
+
+    link.push_str(services::service_path_from(&data).as_str());
 
     Ok(link)
 }
@@ -264,8 +269,8 @@ fn search_references(
 }
 
 fn split_shorthand(shorthand: &str) -> (&str, &str) {
-    let parts = shorthand.split('/').collect::<Vec<&str>>();
-    (parts[0], parts[1])
+    let (first, rest) = shorthand.split_once('/').unwrap();
+    (first, rest)
 }
 
 fn project_name(url: &GitUrl) -> String {
