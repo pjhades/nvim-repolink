@@ -8,9 +8,6 @@ use nvim_oxi::{api, lua, print, Dictionary, Function, Object};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-mod services;
-use services::LineRange;
-
 #[derive(Serialize, Deserialize)]
 struct Config {}
 
@@ -67,21 +64,90 @@ enum PluginError {
     #[error("Repository is bare")]
     BareRepository,
 
-    #[error("Missing Git hosting site")]
-    MissingGitHostingSite,
+    #[error("Missing Git service")]
+    MissingGitService,
 
     #[error("Missing repository owner")]
     MissingRepositoryOwner,
 
-    #[error("Unsupported Git hosting site: {0}")]
-    UnsupportedGitHostingSite(String),
+    #[error("Unsupported Git service: {0}")]
+    UnsupportedGitService(String),
 }
 
-#[derive(Debug, PartialEq)]
-enum GitObject {
-    Branch(String),
-    Tag(String),
-    Commit(String),
+#[derive(Copy, Clone)]
+enum GitService {
+    GitHub,
+    SourceHut,
+}
+
+impl GitService {
+    fn new(url: &GitUrl) -> Result<Self, PluginError> {
+        if url.owner.is_none() {
+            return Err(PluginError::MissingRepositoryOwner);
+        }
+        match url.host.as_ref().map(|s| s.as_str()) {
+            Some("github.com") => Ok(Self::GitHub),
+            Some("git.sr.ht") => Ok(Self::SourceHut),
+            Some(s) => Err(PluginError::UnsupportedGitService(s.to_string())),
+            None => Err(PluginError::MissingGitService),
+        }
+    }
+}
+
+struct LineRange(usize, usize);
+
+struct GitServiceUrl {
+    service: GitService,
+    url: GitUrl,
+    obj: String,
+    path: String,
+    range: Option<LineRange>,
+}
+
+impl GitServiceUrl {
+    fn new(
+        url: GitUrl,
+        obj: String,
+        path: String,
+        range: Option<LineRange>,
+    ) -> Result<Self, PluginError> {
+        Ok(Self {
+            service: GitService::new(&url)?,
+            url,
+            obj,
+            path,
+            range,
+        })
+    }
+}
+
+impl std::fmt::Display for GitServiceUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        let path = match (self.service, &self.obj) {
+            // https://github.com/<owner>/<project>/blob/<obj>/<path>
+            (GitService::GitHub, obj) => format!("blob/{}/{}", obj, self.path),
+            // https://git.sr.ht/<owner>/<project>/tree/<obj>/item/<path>
+            (GitService::SourceHut, obj) => format!("tree/{}/item/{}", obj, self.path),
+        };
+
+        let range = match (self.service, self.range.as_ref()) {
+            (_, None) => format!(""),
+            // SourceHut does not have multiline highlighting at the time of writing.
+            (GitService::SourceHut, Some(LineRange(a, _))) => format!("#L{a}"),
+            (_, Some(LineRange(a, b))) if a == b => format!("#L{a}"),
+            (_, Some(LineRange(a, b))) => format!("#L{a}-L{b}"),
+        };
+
+        write!(
+            f,
+            "https://{}/{}/{}/{}{}",
+            self.url.host.as_ref().unwrap(),
+            self.url.owner.as_ref().unwrap(),
+            project_name(&self.url),
+            path,
+            range
+        )
+    }
 }
 
 #[nvim_oxi::plugin]
@@ -136,12 +202,12 @@ fn generate_repolink(args: CommandArgs) -> Result<(), PluginError> {
         Some(LineRange(args.line1, args.line2))
     };
 
-    print!("{}", make_link(url, head_obj, rel_path, range)?);
+    print!("{}", GitServiceUrl::new(url, head_obj, rel_path, range)?);
 
     Ok(())
 }
 
-fn figure_out_git_head(repo: &Repository, remote_name: &str) -> Result<GitObject, PluginError> {
+fn figure_out_git_head(repo: &Repository, remote_name: &str) -> Result<String, PluginError> {
     let head = repo.head()?;
 
     if head.is_note() || head.is_tag() || head.is_remote() {
@@ -155,12 +221,12 @@ fn figure_out_git_head(repo: &Repository, remote_name: &str) -> Result<GitObject
             }
             std::str::from_utf8(r.shorthand_bytes())
                 .ok()
-                .map(|s| GitObject::Tag(s.to_string()))
+                .map(|s| s.to_string())
         })?
         .or_else(|| {
             head.peel_to_commit()
                 .ok()
-                .map(|commit| GitObject::Commit(commit.id().to_string()))
+                .map(|commit| commit.id().to_string())
         })
     } else if head.is_branch() {
         get_remote_branch(&repo, remote_name)?
@@ -171,52 +237,10 @@ fn figure_out_git_head(repo: &Repository, remote_name: &str) -> Result<GitObject
     head_obj.ok_or(PluginError::InvalidHeadType)
 }
 
-fn make_link(
-    url: GitUrl,
-    head_obj: GitObject,
-    path: String,
-    range: Option<LineRange>,
-) -> Result<String, PluginError> {
-    let project = project_name(&url);
-    let host = url.host.ok_or(PluginError::MissingGitHostingSite)?;
-    let owner = url.owner.ok_or(PluginError::MissingRepositoryOwner)?;
-    let mut link = String::new();
-
-    use services::Data;
-
-    let service = services::service_for(host.as_str());
-    if service.is_none() {
-        return Err(PluginError::UnsupportedGitHostingSite(host));
-    }
-
-    let mut data = Data{
-        project: project.as_str(),
-        owner: owner.as_str(),
-        path: path.as_str(),
-        service: service.unwrap(),
-        line_range: &range,
-        branch_or_tag_name: None,
-        hash: None,
-    };
-
-    link.push_str(services::project_url_from(&data).as_str());
-
-    match head_obj {
-        GitObject::Branch(name) | GitObject::Tag(name) =>
-            data.branch_or_tag_name = Some(name),
-        GitObject::Commit(hash) =>
-            data.hash = Some(hash),
-    }
-
-    link.push_str(services::service_path_from(&data).as_str());
-
-    Ok(link)
-}
-
 fn get_remote_branch(
     repo: &Repository,
     wanted_remote: &str,
-) -> Result<Option<GitObject>, PluginError> {
+) -> Result<Option<String>, PluginError> {
     let head = repo.head()?;
     let name =
         std::str::from_utf8(head.shorthand_bytes()).map_err(|_| PluginError::Utf8("HEAD"))?;
@@ -227,7 +251,7 @@ fn get_remote_branch(
             let shorthand = std::str::from_utf8(upstream.name_bytes()?)
                 .map_err(|_| PluginError::Utf8("remote branch"))?;
             let (_, branch) = split_shorthand(shorthand);
-            Ok(Some(GitObject::Branch(branch.to_string())))
+            Ok(Some(branch.to_string()))
         }
         Err(e) if e.code() == ErrorCode::NotFound => search_references(&repo, |r| {
             if !r.is_remote() {
@@ -238,7 +262,7 @@ fn get_remote_branch(
                 .and_then(|shorthand| {
                     let (remote, branch) = split_shorthand(shorthand);
                     if remote == wanted_remote && branch != "HEAD" {
-                        Some(GitObject::Branch(branch.to_string()))
+                        Some(branch.to_string())
                     } else {
                         None
                     }
@@ -250,8 +274,8 @@ fn get_remote_branch(
 
 fn search_references(
     repo: &Repository,
-    f: impl Fn(Reference<'_>) -> Option<GitObject>,
-) -> Result<Option<GitObject>, PluginError> {
+    f: impl Fn(Reference<'_>) -> Option<String>,
+) -> Result<Option<String>, PluginError> {
     let head = repo.head()?;
     let hash = head.peel_to_commit()?.id();
     let ret = repo.references()?.find_map(|r| {
