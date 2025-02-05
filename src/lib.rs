@@ -8,9 +8,6 @@ use nvim_oxi::{api, lua, print, Dictionary, Function, Object};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-//mod services;
-//use services::LineRange;
-
 #[derive(Serialize, Deserialize)]
 struct Config {}
 
@@ -90,30 +87,49 @@ enum GitHostingSite {
     SourceHut,
 }
 
+impl GitHostingSite {
+    const GITHUB: &'static str = "github.com";
+    const SOURCEHUT: &'static str = "git.sr.ht";
+
+    fn from_host(s: &str) -> Result<Self, PluginError> {
+        match s {
+            Self::GITHUB => Ok(Self::GitHub),
+            Self::SOURCEHUT => Ok(Self::SourceHut),
+            _ => Err(PluginError::UnsupportedGitHostingSite(s.to_string())),
+        }
+    }
+}
+
 struct LineRange(usize, usize);
 
 struct GitHostingUrl {
     site: GitHostingSite,
-    url: GitUrl,
+    project: String,
+    host: String,
+    owner: String,
     obj: GitObject,
+    path: String,
     range: Option<LineRange>,
 }
 
 impl GitHostingUrl {
-    fn new(url: GitUrl, obj: GitObject, range: Option<LineRange>) -> Result<Self, PluginError> {
-        let host = url
-            .host
-            .as_ref()
-            .ok_or(PluginError::MissingGitHostingSite)?;
-        let site = match host.as_str() {
-            "github.com" => GitHostingSite::GitHub,
-            "git.sr.ht" => GitHostingSite::SourceHut,
-            _ => return Err(PluginError::UnsupportedGitHostingSite(host.to_string())),
-        };
+    fn new(
+        url: GitUrl,
+        obj: GitObject,
+        path: String,
+        range: Option<LineRange>,
+    ) -> Result<Self, PluginError> {
+        let project = project_name(&url);
+        let host = url.host.ok_or(PluginError::MissingGitHostingSite)?;
+        let owner = url.owner.ok_or(PluginError::MissingRepositoryOwner)?;
+        let site = GitHostingSite::from_host(&host)?;
         Ok(Self {
             site,
-            url,
+            project,
+            host,
+            owner,
             obj,
+            path,
             range,
         })
     }
@@ -121,21 +137,39 @@ impl GitHostingUrl {
 
 impl std::fmt::Display for GitHostingUrl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        let range = self.range.as_ref().map(|r| {
-            match (self.site, r) {
-                (GitHostingSite::GitHub, LineRange(a, b)) if a == b => format!("#L{a}"),
-                (GitHostingSite::GitHub, LineRange(a, b)) => format!("#L{a}-{b}"),
-                // SourceHut does not have multiline select at the time of writing.
-                (GitHostingSite::SourceHut, LineRange(a, _)) => format!("#L{a}"),
+        let path = match (self.site, &self.obj) {
+            (GitHostingSite::GitHub, GitObject::Branch(name))
+            | (GitHostingSite::GitHub, GitObject::Tag(name)) => {
+                format!("blob/{}/{}", name, self.path)
             }
-        });
+            // TODO: Github also supports /blob/<commit>/... to browse files at that point
+            (GitHostingSite::GitHub, GitObject::Commit(commit)) => format!("commit/{}", commit),
+            _ => panic!("caca moulu"),
+        };
+
+        let range = self
+            .range
+            .as_ref()
+            .map(|r| {
+                match (self.site, r) {
+                    (GitHostingSite::GitHub, LineRange(a, b)) if a == b => format!("#L{a}"),
+                    (GitHostingSite::GitHub, LineRange(a, b)) => format!("#L{a}-{b}"),
+                    // SourceHut does not have multiline select at the time of writing.
+                    (GitHostingSite::SourceHut, LineRange(a, _)) => format!("#L{a}"),
+                }
+            })
+            .unwrap_or("".to_string());
 
         match self.site {
-            GitHostingSite::GitHub => {}
-            GitHostingSite::SourceHut => {}
+            GitHostingSite::GitHub => {
+                write!(
+                    f,
+                    "https://{}/{}/{}/{}{}",
+                    self.host, self.owner, self.project, path, range
+                )
+            }
+            GitHostingSite::SourceHut => Ok(()),
         }
-
-        Ok(())
     }
 }
 
@@ -191,9 +225,7 @@ fn generate_repolink(args: CommandArgs) -> Result<(), PluginError> {
         Some(LineRange(args.line1, args.line2))
     };
 
-    print!("{}", GitHostingUrl::new(url, head_obj, range)?);
-
-    //print!("{}", make_link(url, head_obj, rel_path, range)?);
+    print!("{}", GitHostingUrl::new(url, head_obj, rel_path, range)?);
 
     Ok(())
 }
@@ -227,46 +259,6 @@ fn figure_out_git_head(repo: &Repository, remote_name: &str) -> Result<GitObject
 
     head_obj.ok_or(PluginError::InvalidHeadType)
 }
-
-//fn make_link(
-//    url: GitUrl,
-//    head_obj: GitObject,
-//    path: String,
-//    range: Option<LineRange>,
-//) -> Result<String, PluginError> {
-//    let project = project_name(&url);
-//    let host = url.host.ok_or(PluginError::MissingGitHostingSite)?;
-//    let owner = url.owner.ok_or(PluginError::MissingRepositoryOwner)?;
-//    let mut link = String::new();
-//
-//    use services::Data;
-//
-//    let service = services::service_for(host.as_str());
-//    if service.is_none() {
-//        return Err(PluginError::UnsupportedGitHostingSite(host));
-//    }
-//
-//    let mut data = Data {
-//        project: project.as_str(),
-//        owner: owner.as_str(),
-//        path: path.as_str(),
-//        service: service.unwrap(),
-//        line_range: &range,
-//        branch_or_tag_name: None,
-//        hash: None,
-//    };
-//
-//    link.push_str(services::project_url_from(&data).as_str());
-//
-//    match head_obj {
-//        GitObject::Branch(name) | GitObject::Tag(name) => data.branch_or_tag_name = Some(name),
-//        GitObject::Commit(hash) => data.hash = Some(hash),
-//    }
-//
-//    link.push_str(services::service_path_from(&data).as_str());
-//
-//    Ok(link)
-//}
 
 fn get_remote_branch(
     repo: &Repository,
