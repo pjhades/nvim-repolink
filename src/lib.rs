@@ -78,6 +78,7 @@ enum PluginError {
 enum GitService {
     GitHub,
     SourceHut,
+    Codeberg,
 }
 
 impl GitService {
@@ -88,8 +89,32 @@ impl GitService {
         match url.host.as_ref().map(|s| s.as_str()) {
             Some("github.com") => Ok(Self::GitHub),
             Some("git.sr.ht") => Ok(Self::SourceHut),
+            Some("codeberg.org") => Ok(Self::Codeberg),
             Some(s) => Err(PluginError::UnsupportedGitService(s.to_string())),
             None => Err(PluginError::MissingGitService),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum GitObject {
+    Branch(String),
+    Tag(String),
+    Commit(String),
+}
+
+impl GitObject {
+    fn name(&self) -> String {
+        match self {
+            Self::Branch(name) | Self::Tag(name) | Self::Commit(name) => name.to_string(),
+        }
+    }
+
+    fn type_slash_name(&self) -> String {
+        match self {
+            Self::Branch(name) => format!("branch/{name}"),
+            Self::Tag(name) => format!("tag/{name}"),
+            Self::Commit(name) => format!("commit/{name}"),
         }
     }
 }
@@ -99,7 +124,7 @@ struct LineRange(usize, usize);
 struct GitServiceUrl {
     service: GitService,
     url: GitUrl,
-    obj: String,
+    obj: GitObject,
     path: String,
     range: Option<LineRange>,
 }
@@ -107,7 +132,7 @@ struct GitServiceUrl {
 impl GitServiceUrl {
     fn new(
         url: GitUrl,
-        obj: String,
+        obj: GitObject,
         path: String,
         range: Option<LineRange>,
     ) -> Result<Self, PluginError> {
@@ -124,10 +149,12 @@ impl GitServiceUrl {
 impl std::fmt::Display for GitServiceUrl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         let path = match (self.service, &self.obj) {
-            // https://github.com/<owner>/<project>/blob/<obj>/<path>
-            (GitService::GitHub, obj) => format!("blob/{}/{}", obj, self.path),
-            // https://git.sr.ht/<owner>/<project>/tree/<obj>/item/<path>
-            (GitService::SourceHut, obj) => format!("tree/{}/item/{}", obj, self.path),
+            // https://github.com/<owner>/<project>/blob/<git_obj_name>/<path>
+            (GitService::GitHub, obj) => format!("blob/{}/{}", obj.name(), self.path),
+            // https://git.sr.ht/<owner>/<project>/tree/<git_obj_name>/item/<path>
+            (GitService::SourceHut, obj) => format!("tree/{}/item/{}", obj.name(), self.path),
+            // https://codeberg.org/<owner>/<project>/src/<git_obj>/<git_obj_name>/<path>
+            (GitService::Codeberg, obj) => format!("src/{}/{}", obj.type_slash_name(), self.path),
         };
 
         let range = match (self.service, self.range.as_ref()) {
@@ -207,7 +234,7 @@ fn generate_repolink(args: CommandArgs) -> Result<(), PluginError> {
     Ok(())
 }
 
-fn figure_out_git_head(repo: &Repository, remote_name: &str) -> Result<String, PluginError> {
+fn figure_out_git_head(repo: &Repository, remote_name: &str) -> Result<GitObject, PluginError> {
     let head = repo.head()?;
 
     if head.is_note() || head.is_tag() || head.is_remote() {
@@ -221,12 +248,12 @@ fn figure_out_git_head(repo: &Repository, remote_name: &str) -> Result<String, P
             }
             std::str::from_utf8(r.shorthand_bytes())
                 .ok()
-                .map(|s| s.to_string())
+                .map(|s| GitObject::Tag(s.to_string()))
         })?
         .or_else(|| {
             head.peel_to_commit()
                 .ok()
-                .map(|commit| commit.id().to_string())
+                .map(|commit| GitObject::Commit(commit.id().to_string()))
         })
     } else if head.is_branch() {
         get_remote_branch(&repo, remote_name)?
@@ -240,7 +267,7 @@ fn figure_out_git_head(repo: &Repository, remote_name: &str) -> Result<String, P
 fn get_remote_branch(
     repo: &Repository,
     wanted_remote: &str,
-) -> Result<Option<String>, PluginError> {
+) -> Result<Option<GitObject>, PluginError> {
     let head = repo.head()?;
     let name =
         std::str::from_utf8(head.shorthand_bytes()).map_err(|_| PluginError::Utf8("HEAD"))?;
@@ -251,7 +278,7 @@ fn get_remote_branch(
             let shorthand = std::str::from_utf8(upstream.name_bytes()?)
                 .map_err(|_| PluginError::Utf8("remote branch"))?;
             let (_, branch) = split_shorthand(shorthand);
-            Ok(Some(branch.to_string()))
+            Ok(Some(GitObject::Branch(branch.to_string())))
         }
         Err(e) if e.code() == ErrorCode::NotFound => search_references(&repo, |r| {
             if !r.is_remote() {
@@ -262,7 +289,7 @@ fn get_remote_branch(
                 .and_then(|shorthand| {
                     let (remote, branch) = split_shorthand(shorthand);
                     if remote == wanted_remote && branch != "HEAD" {
-                        Some(branch.to_string())
+                        Some(GitObject::Branch(branch.to_string()))
                     } else {
                         None
                     }
@@ -274,8 +301,8 @@ fn get_remote_branch(
 
 fn search_references(
     repo: &Repository,
-    f: impl Fn(Reference<'_>) -> Option<String>,
-) -> Result<Option<String>, PluginError> {
+    f: impl Fn(Reference<'_>) -> Option<GitObject>,
+) -> Result<Option<GitObject>, PluginError> {
     let head = repo.head()?;
     let hash = head.peel_to_commit()?.id();
     let ret = repo.references()?.find_map(|r| {
