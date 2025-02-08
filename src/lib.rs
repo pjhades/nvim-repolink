@@ -67,9 +67,6 @@ enum PluginError {
     #[error("Missing Git service")]
     MissingGitService,
 
-    #[error("Missing repository owner")]
-    MissingRepositoryOwner,
-
     #[error("Unsupported Git service: {0}")]
     UnsupportedGitService(String),
 }
@@ -77,17 +74,16 @@ enum PluginError {
 #[derive(Copy, Clone)]
 enum GitService {
     GitHub,
+    GitLab,
     SourceHut,
     Codeberg,
 }
 
 impl GitService {
     fn new(url: &GitUrl) -> Result<Self, PluginError> {
-        if url.owner.is_none() {
-            return Err(PluginError::MissingRepositoryOwner);
-        }
         match url.host.as_ref().map(|s| s.as_str()) {
             Some("github.com") => Ok(Self::GitHub),
+            Some("gitlab.com") => Ok(Self::GitLab),
             Some("git.sr.ht") => Ok(Self::SourceHut),
             Some("codeberg.org") => Ok(Self::Codeberg),
             Some(s) => Err(PluginError::UnsupportedGitService(s.to_string())),
@@ -149,11 +145,13 @@ impl GitServiceUrl {
 impl std::fmt::Display for GitServiceUrl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         let path = match (self.service, &self.obj) {
-            // https://github.com/<owner>/<project>/blob/<git_obj_name>/<path>
+            // https://github.com/<project_path>/blob/<git_obj_name>/<path>
             (GitService::GitHub, obj) => format!("blob/{}/{}", obj.name(), self.path),
-            // https://git.sr.ht/<owner>/<project>/tree/<git_obj_name>/item/<path>
+            // https://gitlab.redox-os.org/<project_path>/-/blob/<git_obj_name>/<path>
+            (GitService::GitLab, obj) => format!("-/blob/{}/{}", obj.name(), self.path),
+            // https://git.sr.ht/<project_path>/tree/<git_obj_name>/item/<path>
             (GitService::SourceHut, obj) => format!("tree/{}/item/{}", obj.name(), self.path),
-            // https://codeberg.org/<owner>/<project>/src/<git_obj>/<git_obj_name>/<path>
+            // https://codeberg.org/<project_path>/src/<git_obj>/<git_obj_name>/<path>
             (GitService::Codeberg, obj) => format!("src/{}/{}", obj.type_slash_name(), self.path),
         };
 
@@ -161,16 +159,16 @@ impl std::fmt::Display for GitServiceUrl {
             (_, None) => format!(""),
             // SourceHut does not have multiline highlighting at the time of writing.
             (GitService::SourceHut, Some(LineRange(a, _))) => format!("#L{a}"),
+            (GitService::GitLab, Some(LineRange(a, b))) if a != b => format!("#L{a}-{b}"),
             (_, Some(LineRange(a, b))) if a == b => format!("#L{a}"),
             (_, Some(LineRange(a, b))) => format!("#L{a}-L{b}"),
         };
 
         write!(
             f,
-            "https://{}/{}/{}/{}{}",
+            "https://{}/{}/{}{}",
             self.url.host.as_ref().unwrap(),
-            self.url.owner.as_ref().unwrap(),
-            project_name(&self.url),
+            project_path(&self.url),
             path,
             range
         )
@@ -324,12 +322,15 @@ fn split_shorthand(shorthand: &str) -> (&str, &str) {
     (first, rest)
 }
 
-fn project_name(url: &GitUrl) -> String {
-    let parts = url.path.as_str().split('/').collect::<Vec<&str>>();
-    let name = parts.iter().last().unwrap();
+fn project_path(url: &GitUrl) -> String {
+    let path = url
+        .path
+        .as_str()
+        .strip_prefix("/")
+        .unwrap_or(url.path.as_str());
     if url.git_suffix {
-        name.strip_suffix(".git").unwrap().to_string()
+        path.strip_suffix(".git").unwrap().to_string()
     } else {
-        name.to_string()
+        path.to_string()
     }
 }
